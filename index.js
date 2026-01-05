@@ -148,25 +148,15 @@ async function run() {
     });
 
     /* ===== Current User ===== */
-    app.get('/api/me', authMiddleware, async (req, res) => {
+    app.get('/api/me', async (req, res) => {
         try {
-
-            console.log("🍪 cookies:", req.cookies);
-            console.log("👤 jwt user:", req.user);
-
-            const user = await users.findOne({
-                telegramId: req.user.id
-            });
-
-            if (!user) {
-                return res.status(404).json({ ok: false });
-            }
-
-            res.json({ ok: true, user });
+            const usersList = await users.find({}).toArray(); // 🔥 FIX
+            res.json({ ok: true, users: usersList });
         } catch (err) {
-            res.status(500).json({ ok: false });
+            res.status(500).json({ ok: false, message: err.message });
         }
     });
+
 
 
     /* ===== Logout ===== */
