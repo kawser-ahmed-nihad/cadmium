@@ -1,6 +1,5 @@
-
 require('dotenv').config();
-
+const { validateTelegramWebAppData } = require('./telegramAuth.js')
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -8,7 +7,7 @@ const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 const { Telegraf } = require('telegraf');
-
+const { encrypt, decrypt, SESSION_DURATION } = require('./jwt.js');
 /* ================= BASIC SETUP ================= */
 const app = express();
 const port = process.env.PORT || 3000;
@@ -17,17 +16,15 @@ app.use(express.json());
 app.use(cookieParser());
 
 app.use(cors({
-    origin: true,
+    origin: ['http://localhost:5173', 'https://prefeudal-lowell-unfitting.ngrok-free.dev', 'https://timely-alfajores-e0751b.netlify.app'],
     credentials: true
 }));
 
 /* ================= ENV ================= */
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const WEBAPP_URL = process.env.WEBAPP_URL;
-const JWT_SECRET = process.env.JWT_SECRET;
+// const JWT_SECRET = process.env.JWT_SECRET;
 
-const REF_BONUS = Number(process.env.REF_BONUS || 50);
-const DEFAULT_EARN_PER_SEC = Number(process.env.DEFAULT_EARN_PER_SEC || 2);
 
 /* ================= MONGODB ================= */
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.gyokyfk.mongodb.net/?retryWrites=true&w=majority`;
@@ -41,8 +38,6 @@ const client = new MongoClient(uri, {
 });
 
 let users;
-
-
 
 /* ================= TELEGRAM VERIFY ================= */
 function verifyTelegram(initData) {
@@ -94,80 +89,123 @@ function authMiddleware(req, res, next) {
 /* ================= EXPRESS API ================= */
 async function run() {
     await client.connect();
-    users = client.db('telegram_db').collection('users');
+    usersCollection = client.db('telegram_db').collection('users');
 
     // 🔒 Prevent duplicate users
-    await users.createIndex({ telegramId: 1 }, { unique: true });
+    await usersCollection.createIndex({ telegramId: 1 }, { unique: true });
 
     console.log('✅ MongoDB Connected');
 
+
     /* ===== Telegram WebApp Login ===== */
-    app.post('/api/auth/telegram', async (req, res) => {
-        try {
-            const { initData } = req.body;
-            if (!initData)
-                return res.status(400).json({ ok: false, message: 'initData missing' });
+    const REFERRAL_BONUS = 50;
 
-            if (!verifyTelegram(initData))
-                return res.status(403).json({ ok: false, message: 'Invalid Telegram data' });
+    app.post('/api/auth', async (req, res) => {
+        
+        function generateReferralCode(user) {
+            return `${user.username || 'user'}-${user.id}`;
+        }
+        const { initData, ref } = req.body
+        const user = validateTelegramWebAppData(initData)
 
-            const params = new URLSearchParams(initData);
-            const tgUser = JSON.parse(params.get('user'));
-            const telegramId = tgUser.id;
+        if (!user) return res.status(401).json({ message: 'Invalid Telegram data' })
 
-            let user = await users.findOne({ telegramId });
-            if (!user) {
-                user = {
-                    telegramId,
-                    username: tgUser.username || '',
-                    firstName: tgUser.first_name || '',
-                    balance: 0,
-                    earnPerSec: DEFAULT_EARN_PER_SEC,
-                    createdAt: new Date()
-                };
-                await users.insertOne(user);
+        const existingUser = await usersCollection.findOne({ telegramId: user.id })
+        let referralCode
+
+        if (!existingUser) {
+            referralCode = generateReferralCode(user)
+
+            // New user signup with referral
+            let referredBy = null
+            if (ref) {
+                // check if referral code exists
+                const refUser = await usersCollection.findOne({ referralCode: ref })
+                if (refUser) {
+                    referredBy = refUser.referralCode
+
+                    // Add bonus to referrer
+                    await usersCollection.updateOne(
+                        { telegramId: refUser.telegramId },
+                        { $inc: { bonus: REFERRAL_BONUS } }
+                    )
+                }
             }
 
-            const token = generateToken(user);
-
-            // 🍪 HTTP-only cookie
-            res.cookie('token', token, {
-                httpOnly: true,
-                secure: process.env.NODE_ENV === 'production',
-                sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-                maxAge: 7 * 24 * 60 * 60 * 1000
-            });
-
-
-            res.json({ ok: true, user });
-
-        } catch (err) {
-            console.error(err);
-            res.status(500).json({ ok: false, message: 'Server error' });
+            // insert new user
+            await usersCollection.updateOne(
+                { telegramId: user.id },
+                {
+                    $set: {
+                        ...user,
+                        referralCode,
+                        referredBy,
+                        bonus: 0,
+                        lastLogin: new Date()
+                    }
+                },
+                { upsert: true }
+            )
+        } else {
+            // Existing user login
+            await usersCollection.updateOne(
+                { telegramId: user.id },
+                { $set: { lastLogin: new Date() } }
+            )
+            referralCode = existingUser.referralCode
         }
-    });
 
-    /* ===== Current User ===== */
-    app.get('/api/me', async (req, res) => {
-        try {
-            const usersList = await users.find({}).toArray(); // 🔥 FIX
-            res.json({ ok: true, users: usersList });
-        } catch (err) {
-            res.status(500).json({ ok: false, message: err.message });
-        }
-    });
-
-
-
-    /* ===== Logout ===== */
-    app.post('/api/logout', (req, res) => {
-        res.clearCookie('token', {
+        const token = encrypt({ telegramId: user.id })
+        res.cookie('session', token, {
             httpOnly: true,
-            secure: true,
-            sameSite: 'none'
+            sameSite: 'none',
+            secure: true
+        })
+
+        res.json({ message: 'Authenticated', referralCode, bonus: existingUser?.bonus || 0 })
+    })
+
+
+    // ------------------- Middleware -------------------
+    function requireAuth(req, res, next) {
+        const token = req.cookies.session;
+        if (!token) return res.status(401).json({ ok: false, message: 'Not authenticated' });
+
+        try {
+            req.user = decrypt(token);   // decrypt দিয়ে payload পাওয়া যায়
+            next();
+        } catch {
+            return res.status(401).json({ ok: false, message: 'Invalid token' });
+        }
+    }
+
+
+    // ------------------- Current User -------------------
+    app.get('/api/me', requireAuth, async (req, res) => {
+        // console.log(req.cookies); 
+        const user = await usersCollection.findOne({
+            telegramId: req.user.telegramId
         });
-        res.json({ ok: true });
+
+        if (!user) {
+            return res.status(404).json({
+                ok: false,
+                message: 'User not found'
+            });
+        }
+
+        res.json({
+            ok: true,
+            user
+        });
     });
+
+
+    // ------------------- Logout -------------------
+    app.post('/api/logout', requireAuth, (req, res) => {
+        res.clearCookie('session')
+        res.json({ message: 'Logged out' })
+    })
 }
 
 run().catch(console.error);
@@ -216,5 +254,3 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
     console.log(`🚀 Server running on port ${port}`);
 });
-
-
